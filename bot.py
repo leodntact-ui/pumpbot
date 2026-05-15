@@ -127,7 +127,9 @@ def record_prices(ticker_data):
 
 def detect_pump(ticker_data):
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(minutes=WINDOW_MINUTES)
+    # Fenetre stricte : on compare le prix ACTUEL vs prix il y a exactement 10 min
+    cutoff_min = now - timedelta(minutes=WINDOW_MINUTES + 1)  # entre 10 et 11 min
+    cutoff_max = now - timedelta(minutes=WINDOW_MINUTES - 1)  # entre 9 et 10 min
     best_pump = None
     best_pct = PUMP_THRESHOLD
 
@@ -140,16 +142,35 @@ def detect_pump(ticker_data):
                 continue
 
             history = price_history.get(pair, [])
-            old_prices = [(t, p) for t, p in history if t <= cutoff]
 
-            if not old_prices:
+            # FIX CRITIQUE : prend uniquement les prix dans la fenetre 9-11 min
+            # Cela garantit qu'on compare avec un prix d'il y a ~10 min exactement
+            reference_prices = [(t, p) for t, p in history if cutoff_min <= t <= cutoff_max]
+
+            # Si pas de prix dans la fenetre exacte, prend le plus proche disponible
+            if not reference_prices:
+                old_prices = [(t, p) for t, p in history if t <= cutoff_max]
+                if not old_prices:
+                    continue
+                # Prend le plus recent dans les prix anciens (= le plus proche de 10 min)
+                reference_prices = [old_prices[-1]]
+
+            # Prix de reference = moyenne des prix dans la fenetre pour eviter les anomalies
+            ref_price = sum(p for _, p in reference_prices) / len(reference_prices)
+
+            if ref_price <= 0:
                 continue
 
-            oldest_price = old_prices[-1][1]
-            if oldest_price <= 0:
-                continue
+            pct_change = ((current_price - ref_price) / ref_price) * 100
 
-            pct_change = ((current_price - oldest_price) / oldest_price) * 100
+            # FIX : verifie aussi que le prix monte MAINTENANT (momentum positif)
+            # Compare les 3 dernieres mesures pour confirmer la tendance haussiere
+            recent_prices = [(t, p) for t, p in history if t >= now - timedelta(minutes=2)]
+            if len(recent_prices) >= 2:
+                momentum = ((recent_prices[-1][1] - recent_prices[0][1]) / recent_prices[0][1]) * 100
+                if momentum < 0:
+                    # Le prix est en train de baisser maintenant -> pas un bon signal
+                    continue
 
             if pct_change > best_pct:
                 best_pct = pct_change
@@ -265,9 +286,41 @@ def buy_market(pair, usd_amount):
         return None
 
 
+def get_real_crypto_balance(pair_info, base_currency):
+    """Recupere le vrai solde de crypto disponible sur Kraken avant de vendre."""
+    try:
+        resp = k.query_private("Balance")
+        if resp.get("error"):
+            return None
+        balances = resp.get("result", {})
+        # Essaie avec le nom de base et avec prefixe X ou Z
+        balance = float(balances.get(base_currency, 0))
+        if balance == 0:
+            balance = float(balances.get("X" + base_currency, 0))
+        if balance == 0:
+            balance = float(balances.get("Z" + base_currency, 0))
+        return balance if balance > 0 else None
+    except Exception as e:
+        log.error(f"Exception get_real_crypto_balance: {e}")
+        return None
+
+
 def sell_market(pair, volume, reason=""):
     try:
-        volume_str = str(round(float(volume), 8))
+        # FIX — Recupere le vrai solde de crypto sur Kraken
+        pair_info = get_pair_info(pair)
+        base_currency = pair_info.get("base", "") if pair_info else ""
+        
+        real_balance = get_real_crypto_balance(pair_info, base_currency)
+        
+        if real_balance and real_balance < float(volume):
+            log.warning(f"Volume ajuste: {volume} -> {real_balance} (solde reel)")
+            volume = real_balance
+
+        # Arrondit correctement selon lot_decimals
+        lot_decimals = int(pair_info.get("lot_decimals", 8)) if pair_info else 8
+        volume_str = str(round(float(volume), lot_decimals))
+        
         log.info(f"[VENTE] VENTE {pair} | Volume: {volume_str} | Raison: {reason}")
 
         resp = k.query_private("AddOrder", {
@@ -388,20 +441,8 @@ def main():
                     f"Dump60s: {dump_pct:+.2f}%"
                 )
 
-                # 🚨 PRIORITÉ 1 — DUMP BRUTAL : -5% en 60 secondes
-                if is_dump:
-                    log.warning(f"[DUMP] DUMP BRUTAL DÉTECTÉ ! {dump_pct:.2f}% en {DUMP_WINDOW_SEC}s → VENTE IMMÉDIATE")
-                    success = sell_market(position["pair"], position["volume"], reason="DUMP BRUTAL")
-                    if success:
-                        log.info(f"[RAPIDE] Sorti rapidement | P&L: {pct_from_buy:.2f}%")
-                        reset_position()
-                    else:
-                        log.error("[ATTENTION] Vente dump échouée ! Nouvelle tentative dans 2s...")
-                        time.sleep(2)
-                        sell_market(position["pair"], position["volume"], reason="DUMP BRUTAL RETRY")
-
-                # [STOP] PRIORITÉ 2 — STOP LOSS : -1% depuis l'achat
-                elif pct_from_buy <= -STOP_LOSS_PCT:
+                # PRIORITE 1 — STOP LOSS : -1% depuis l'achat (ABSOLU, toujours en premier)
+                if pct_from_buy <= -STOP_LOSS_PCT:
                     log.warning(f"[STOP] STOP LOSS déclenché à {pct_from_buy:.2f}%")
                     success = sell_market(position["pair"], position["volume"], reason="STOP LOSS")
                     if success:
@@ -411,8 +452,22 @@ def main():
                         log.error("[ATTENTION] Vente stop loss échouée ! Nouvelle tentative dans 2s...")
                         time.sleep(2)
                         sell_market(position["pair"], position["volume"], reason="STOP LOSS RETRY")
+                        reset_position()
 
-                # [TP] PRIORITÉ 3 — TRAILING STOP : -5% depuis le plus haut ET en profit
+                # PRIORITE 2 — DUMP BRUTAL : -5% en 60s SEULEMENT si on est encore en profit
+                elif is_dump and pct_from_buy > 0:
+                    log.warning(f"[DUMP] DUMP BRUTAL EN PROFIT ! {dump_pct:.2f}% en {DUMP_WINDOW_SEC}s → VENTE")
+                    success = sell_market(position["pair"], position["volume"], reason="DUMP BRUTAL")
+                    if success:
+                        log.info(f"[RAPIDE] Sorti en profit | P&L: {pct_from_buy:.2f}%")
+                        reset_position()
+                    else:
+                        log.error("[ATTENTION] Vente dump échouée ! Nouvelle tentative dans 2s...")
+                        time.sleep(2)
+                        sell_market(position["pair"], position["volume"], reason="DUMP BRUTAL RETRY")
+                        reset_position()
+
+                # PRIORITE 3 — TRAILING STOP : -5% depuis le plus haut ET en profit
                 elif pct_from_top <= -TRAILING_STOP_PCT and pct_from_buy > 0:
                     log.info(f"[TP] TRAILING STOP | Profit final: {pct_from_buy:.2f}%")
                     success = sell_market(position["pair"], position["volume"], reason="TRAILING STOP")
@@ -423,6 +478,7 @@ def main():
                         log.error("[ATTENTION] Vente trailing stop échouée ! Nouvelle tentative dans 2s...")
                         time.sleep(2)
                         sell_market(position["pair"], position["volume"], reason="TRAILING STOP RETRY")
+                        reset_position()
 
                 # Vérification rapide toutes les 3 secondes en position
                 time.sleep(POSITION_INTERVAL)
