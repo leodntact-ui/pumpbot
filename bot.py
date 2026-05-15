@@ -6,28 +6,27 @@ from datetime import datetime, timedelta, timezone
 from collections import deque
 
 # ============================================================
-#  CONFIGURATION — Clés API via variables d'environnement
-#  Sur Railway : configure API_KEY et API_SECRET dans Variables
+#  CONFIGURATION
 # ============================================================
 API_KEY    = os.environ.get("API_KEY", "METS_TA_CLE_API_ICI")
 API_SECRET = os.environ.get("API_SECRET", "METS_TON_SECRET_ICI")
 
 # ============================================================
-#  PARAMÈTRES DE LA STRATÉGIE
+#  PARAMETRES
 # ============================================================
-PUMP_THRESHOLD     = 5.0   # % de hausse en 10 min pour déclencher un achat
-WINDOW_MINUTES     = 10    # Fenêtre de détection du pump (minutes)
-TRAILING_STOP_PCT  = 5.0   # % de chute depuis le plus haut → vente en bénéf
-STOP_LOSS_PCT      = 1.0   # % de perte max depuis l'achat → stop loss
-DUMP_PCT           = 5.0   # % de chute en 60 secondes → vente dump brutal
-DUMP_WINDOW_SEC    = 60    # Fenêtre de détection dump (secondes)
-SCAN_INTERVAL      = 30    # Secondes entre chaque scan sans position
-POSITION_INTERVAL  = 3     # Secondes entre chaque vérification en position
-MIN_VOLUME_USD     = 50000 # Volume minimum USD pour filtrer tokens illiquides
-BATCH_SIZE         = 50    # Taille des batch pour l'API Kraken
+PUMP_THRESHOLD    = 5.0    # % hausse en 10 min pour acheter
+WINDOW_MINUTES    = 10     # Fenetre detection pump
+TRAILING_STOP_PCT = 5.0    # % chute depuis le plus haut -> vente benefice
+STOP_LOSS_PCT     = 1.0    # % perte max depuis achat -> stop loss ABSOLU
+DUMP_PCT          = 5.0    # % chute en 60s -> vente si en profit
+DUMP_WINDOW_SEC   = 60     # Fenetre detection dump
+SCAN_INTERVAL     = 30     # Secondes entre chaque scan
+POSITION_INTERVAL = 3      # Secondes entre chaque verif en position
+MIN_VOLUME_USD    = 50000  # Volume minimum USD
+BATCH_SIZE        = 50     # Batch API Kraken
 
 # ============================================================
-#  SETUP LOGGING
+#  LOGGING
 # ============================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -45,7 +44,7 @@ log = logging.getLogger(__name__)
 k = krakenex.API(key=API_KEY, secret=API_SECRET)
 
 # ============================================================
-#  ÉTAT DU BOT
+#  ETAT DU BOT
 # ============================================================
 position = {
     "active": False,
@@ -55,12 +54,15 @@ position = {
     "volume": None,
 }
 
-price_history = {}       # Pour détecter les pumps { pair: [(timestamp, price)] }
-position_prices = deque(maxlen=1200) # Max 1200 entrées (3s * 1200 = 1h), évite fuite mémoire
+price_history  = {}
+position_prices = deque(maxlen=1200)
+
+# Blacklist automatique des tokens restreints FR
+BLACKLISTED_PAIRS = set()
 
 
 # ============================================================
-#  FONCTIONS UTILITAIRES
+#  FONCTIONS
 # ============================================================
 
 def get_usd_balance():
@@ -86,11 +88,14 @@ def get_all_usd_pairs():
             return []
         pairs = []
         for pair_name, pair_info in resp["result"].items():
-            quote = pair_info.get("quote", "")
+            quote  = pair_info.get("quote", "")
             status = pair_info.get("status", "online")
-            if quote in ("ZUSD", "USD") and ".d" not in pair_name and status == "online":
+            if (quote in ("ZUSD", "USD") and
+                ".d" not in pair_name and
+                status == "online" and
+                pair_name not in BLACKLISTED_PAIRS):
                 pairs.append(pair_name)
-        log.info(f"{len(pairs)} paires USD actives trouvées")
+        log.info(f"{len(pairs)} paires USD actives trouvees")
         return pairs
     except Exception as e:
         log.error(f"Exception get_all_usd_pairs: {e}")
@@ -99,8 +104,7 @@ def get_all_usd_pairs():
 
 def get_ticker(pairs):
     try:
-        pairs_str = ",".join(pairs)
-        resp = k.query_public("Ticker", {"pair": pairs_str})
+        resp = k.query_public("Ticker", {"pair": ",".join(pairs)})
         if resp.get("error") and not resp.get("result"):
             return {}
         return resp.get("result", {})
@@ -110,7 +114,7 @@ def get_ticker(pairs):
 
 
 def record_prices(ticker_data):
-    now = datetime.now(timezone.utc)
+    now    = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=15)
     for pair, data in ticker_data.items():
         try:
@@ -126,54 +130,48 @@ def record_prices(ticker_data):
 
 
 def detect_pump(ticker_data):
-    now = datetime.now(timezone.utc)
-    # Fenetre stricte : on compare le prix ACTUEL vs prix il y a exactement 10 min
-    cutoff_min = now - timedelta(minutes=WINDOW_MINUTES + 1)  # entre 10 et 11 min
-    cutoff_max = now - timedelta(minutes=WINDOW_MINUTES - 1)  # entre 9 et 10 min
-    best_pump = None
-    best_pct = PUMP_THRESHOLD
+    now        = datetime.now(timezone.utc)
+    cutoff_min = now - timedelta(minutes=WINDOW_MINUTES + 1)
+    cutoff_max = now - timedelta(minutes=WINDOW_MINUTES - 1)
+    best_pump  = None
+    best_pct   = PUMP_THRESHOLD
 
     for pair, data in ticker_data.items():
+        # Ignore les paires blacklistees
+        if pair in BLACKLISTED_PAIRS:
+            continue
         try:
             current_price = float(data["c"][0])
-            volume_usd = float(data["v"][1]) * current_price
+            volume_usd    = float(data["v"][1]) * current_price
 
             if volume_usd < MIN_VOLUME_USD or current_price <= 0:
                 continue
 
             history = price_history.get(pair, [])
 
-            # FIX CRITIQUE : prend uniquement les prix dans la fenetre 9-11 min
-            # Cela garantit qu'on compare avec un prix d'il y a ~10 min exactement
-            reference_prices = [(t, p) for t, p in history if cutoff_min <= t <= cutoff_max]
-
-            # Si pas de prix dans la fenetre exacte, prend le plus proche disponible
-            if not reference_prices:
-                old_prices = [(t, p) for t, p in history if t <= cutoff_max]
-                if not old_prices:
+            # Prix de reference il y a exactement ~10 min
+            ref_prices = [(t, p) for t, p in history if cutoff_min <= t <= cutoff_max]
+            if not ref_prices:
+                old = [(t, p) for t, p in history if t <= cutoff_max]
+                if not old:
                     continue
-                # Prend le plus recent dans les prix anciens (= le plus proche de 10 min)
-                reference_prices = [old_prices[-1]]
+                ref_prices = [old[-1]]
 
-            # Prix de reference = moyenne des prix dans la fenetre pour eviter les anomalies
-            ref_price = sum(p for _, p in reference_prices) / len(reference_prices)
-
+            ref_price = sum(p for _, p in ref_prices) / len(ref_prices)
             if ref_price <= 0:
                 continue
 
             pct_change = ((current_price - ref_price) / ref_price) * 100
 
-            # FIX : verifie aussi que le prix monte MAINTENANT (momentum positif)
-            # Compare les 3 dernieres mesures pour confirmer la tendance haussiere
-            recent_prices = [(t, p) for t, p in history if t >= now - timedelta(minutes=2)]
-            if len(recent_prices) >= 2:
-                momentum = ((recent_prices[-1][1] - recent_prices[0][1]) / recent_prices[0][1]) * 100
+            # Verifie que ca monte encore MAINTENANT (momentum positif)
+            recent = [(t, p) for t, p in history if t >= now - timedelta(minutes=2)]
+            if len(recent) >= 2:
+                momentum = ((recent[-1][1] - recent[0][1]) / recent[0][1]) * 100
                 if momentum < 0:
-                    # Le prix est en train de baisser maintenant -> pas un bon signal
-                    continue
+                    continue  # Prix en train de baisser -> pas bon signal
 
             if pct_change > best_pct:
-                best_pct = pct_change
+                best_pct  = pct_change
                 best_pump = (pair, current_price, pct_change)
 
         except (KeyError, ValueError, IndexError, ZeroDivisionError):
@@ -183,32 +181,21 @@ def detect_pump(ticker_data):
 
 
 def detect_dump(current_price):
-    """
-    Détecte un dump brutal : -DUMP_PCT% en DUMP_WINDOW_SEC secondes.
-    Analyse les prix enregistrés depuis l'ouverture de la position.
-    """
-    now = datetime.now(timezone.utc)
+    now    = datetime.now(timezone.utc)
     cutoff = now - timedelta(seconds=DUMP_WINDOW_SEC)
 
-    # Nettoie les vieux prix hors fenêtre
     while position_prices and position_prices[0][0] < cutoff:
         position_prices.popleft()
 
     if not position_prices:
         return False, 0.0
 
-    # Prix le plus haut dans la fenêtre des 60 dernières secondes
     highest_in_window = max(p for _, p in position_prices)
-
     if highest_in_window <= 0:
         return False, 0.0
 
     pct_drop = ((current_price - highest_in_window) / highest_in_window) * 100
-
-    if pct_drop <= -DUMP_PCT:
-        return True, pct_drop
-
-    return False, pct_drop
+    return (pct_drop <= -DUMP_PCT), pct_drop
 
 
 def get_pair_info(pair):
@@ -225,75 +212,13 @@ def get_pair_info(pair):
         return None
 
 
-def buy_market(pair, usd_amount):
-    try:
-        pair_info = get_pair_info(pair)
-        if not pair_info:
-            log.error(f"Impossible de récupérer les infos de {pair}")
-            return None
-
-        # SECURITE — Refuse tout achat sur paire non-USD
-        quote = pair_info.get("quote", "")
-        if quote not in ("ZUSD", "USD"):
-            log.error(f"REFUS ACHAT : {pair} n'est pas une paire USD (quote={quote})")
-            return None
-
-        lot_decimals = int(pair_info.get("lot_decimals", 8))
-        order_min    = float(pair_info.get("ordermin", 0))
-        cost_min     = float(pair_info.get("costmin", 0))
-
-        if usd_amount < cost_min:
-            log.warning(f"Montant {usd_amount:.2f}$ < costmin {cost_min}$ pour {pair}")
-            return None
-
-        ticker_resp = k.query_public("Ticker", {"pair": pair})
-        if ticker_resp.get("error") or not ticker_resp.get("result"):
-            log.error(f"Impossible de récupérer le prix de {pair}")
-            return None
-
-        ticker_result = list(ticker_resp["result"].values())[0]
-        current_price = float(ticker_result["c"][0])
-
-        if current_price <= 0:
-            return None
-
-        volume = round(usd_amount / current_price, lot_decimals)
-
-        if volume < order_min:
-            log.warning(f"Volume {volume} < ordermin {order_min} pour {pair}")
-            return None
-
-        log.info(f"[ACHAT] ACHAT {pair} | Prix: {current_price:.6f} | Volume: {volume} | Total: {usd_amount:.2f}$")
-
-        # oflags fciq = frais déduits en USD (pas en crypto)
-        resp = k.query_private("AddOrder", {
-            "pair": pair,
-            "type": "buy",
-            "ordertype": "market",
-            "volume": str(volume),
-            "oflags": "fciq"
-        })
-
-        if resp.get("error"):
-            log.error(f"Erreur AddOrder achat: {resp['error']}")
-            return None
-
-        log.info(f"[OK] Ordre achat placé: {resp['result']}")
-        return volume, current_price
-
-    except Exception as e:
-        log.error(f"Exception buy_market: {e}")
-        return None
-
-
 def get_real_crypto_balance(pair_info, base_currency):
-    """Recupere le vrai solde de crypto disponible sur Kraken avant de vendre."""
+    """Recupere le vrai solde de crypto sur Kraken avant de vendre."""
     try:
         resp = k.query_private("Balance")
         if resp.get("error"):
             return None
         balances = resp.get("result", {})
-        # Essaie avec le nom de base et avec prefixe X ou Z
         balance = float(balances.get(base_currency, 0))
         if balance == 0:
             balance = float(balances.get("X" + base_currency, 0))
@@ -305,22 +230,82 @@ def get_real_crypto_balance(pair_info, base_currency):
         return None
 
 
+def buy_market(pair, usd_amount):
+    try:
+        pair_info = get_pair_info(pair)
+        if not pair_info:
+            return None
+
+        # Securite USD
+        quote = pair_info.get("quote", "")
+        if quote not in ("ZUSD", "USD"):
+            log.error(f"REFUS : {pair} n'est pas une paire USD")
+            return None
+
+        lot_decimals = int(pair_info.get("lot_decimals", 8))
+        order_min    = float(pair_info.get("ordermin", 0))
+        cost_min     = float(pair_info.get("costmin", 0))
+
+        if usd_amount < cost_min:
+            log.warning(f"Montant {usd_amount:.2f}$ < costmin {cost_min}$")
+            return None
+
+        ticker_resp = k.query_public("Ticker", {"pair": pair})
+        if ticker_resp.get("error") or not ticker_resp.get("result"):
+            return None
+
+        ticker_result = list(ticker_resp["result"].values())[0]
+        current_price = float(ticker_result["c"][0])
+
+        if current_price <= 0:
+            return None
+
+        volume = round(usd_amount / current_price, lot_decimals)
+
+        if volume < order_min:
+            log.warning(f"Volume {volume} < ordermin {order_min}")
+            return None
+
+        log.info(f"[ACHAT] ACHAT {pair} | Prix: {current_price:.6f} | Volume: {volume} | Total: {usd_amount:.2f}$")
+
+        resp = k.query_private("AddOrder", {
+            "pair": pair,
+            "type": "buy",
+            "ordertype": "market",
+            "volume": str(volume),
+            "oflags": "fciq"
+        })
+
+        if resp.get("error"):
+            error_msg = str(resp["error"])
+            log.error(f"Erreur AddOrder achat: {error_msg}")
+            # Blackliste automatiquement les tokens restreints FR
+            if "Invalid permissions" in error_msg or "trading restricted" in error_msg:
+                log.warning(f"[BLACKLIST] {pair} restreint en France -> blackliste")
+                BLACKLISTED_PAIRS.add(pair)
+            return None
+
+        log.info(f"[OK] Ordre achat place: {resp['result']}")
+        return volume, current_price
+
+    except Exception as e:
+        log.error(f"Exception buy_market: {e}")
+        return None
+
+
 def sell_market(pair, volume, reason=""):
     try:
-        # FIX — Recupere le vrai solde de crypto sur Kraken
-        pair_info = get_pair_info(pair)
+        pair_info     = get_pair_info(pair)
         base_currency = pair_info.get("base", "") if pair_info else ""
-        
+        lot_decimals  = int(pair_info.get("lot_decimals", 8)) if pair_info else 8
+
+        # Recupere le VRAI solde de crypto sur Kraken
         real_balance = get_real_crypto_balance(pair_info, base_currency)
-        
         if real_balance and real_balance < float(volume):
             log.warning(f"Volume ajuste: {volume} -> {real_balance} (solde reel)")
             volume = real_balance
 
-        # Arrondit correctement selon lot_decimals
-        lot_decimals = int(pair_info.get("lot_decimals", 8)) if pair_info else 8
         volume_str = str(round(float(volume), lot_decimals))
-        
         log.info(f"[VENTE] VENTE {pair} | Volume: {volume_str} | Raison: {reason}")
 
         resp = k.query_private("AddOrder", {
@@ -334,7 +319,7 @@ def sell_market(pair, volume, reason=""):
             log.error(f"Erreur AddOrder vente: {resp['error']}")
             return False
 
-        log.info(f"[OK] Ordre vente placé: {resp['result']}")
+        log.info(f"[OK] Ordre vente place: {resp['result']}")
         return True
 
     except Exception as e:
@@ -347,8 +332,7 @@ def get_current_price(pair):
         resp = k.query_public("Ticker", {"pair": pair})
         if resp.get("error") or not resp.get("result"):
             return None
-        ticker = list(resp["result"].values())[0]
-        return float(ticker["c"][0])
+        return float(list(resp["result"].values())[0]["c"][0])
     except Exception as e:
         log.error(f"Exception get_current_price: {e}")
         return None
@@ -364,7 +348,7 @@ def reset_position():
         "volume": None,
     }
     position_prices.clear()
-    log.info("[RESET] Position réinitialisée — En attente du prochain pump")
+    log.info("[RESET] Position reinitialisee - En attente du prochain pump")
 
 
 # ============================================================
@@ -373,29 +357,29 @@ def reset_position():
 
 def main():
     log.info("=" * 60)
-    log.info("[BOT] PumpBot Kraken démarré")
+    log.info("[BOT] PumpBot Kraken demarre")
     log.info(f"   Seuil pump       : +{PUMP_THRESHOLD}% en {WINDOW_MINUTES} min")
-    log.info(f"   Trailing stop    : -{TRAILING_STOP_PCT}% depuis le plus haut")
-    log.info(f"   Stop loss        : -{STOP_LOSS_PCT}% depuis l'achat")
-    log.info(f"   Détection dump   : -{DUMP_PCT}% en {DUMP_WINDOW_SEC}s → vente immédiate")
-    log.info(f"   Vérif position   : toutes les {POSITION_INTERVAL}s")
+    log.info(f"   Stop loss        : -{STOP_LOSS_PCT}% depuis achat (PRIORITE 1)")
+    log.info(f"   Dump brutal      : -{DUMP_PCT}% en {DUMP_WINDOW_SEC}s si en profit (PRIORITE 2)")
+    log.info(f"   Trailing stop    : -{TRAILING_STOP_PCT}% depuis sommet si en profit (PRIORITE 3)")
+    log.info(f"   Verif position   : toutes les {POSITION_INTERVAL}s")
     log.info("=" * 60)
 
     if API_KEY == "METS_TA_CLE_API_ICI":
-        log.error("[ERREUR] Tu n'as pas configuré tes clés API ! Arrêt du bot.")
+        log.error("[ERREUR] Cles API non configurees ! Arret.")
         return
 
     all_pairs = get_all_usd_pairs()
     if not all_pairs:
-        log.error("Impossible de récupérer les paires. Vérifie ta connexion.")
+        log.error("Impossible de recuperer les paires.")
         return
 
-    log.info("[ATTENTE] Préchauffage de 10 minutes pour constituer l'historique des prix...")
+    log.info("[ATTENTE] Prechauffage de 10 minutes...")
     warmup_end = datetime.now(timezone.utc) + timedelta(minutes=10)
 
     while datetime.now(timezone.utc) < warmup_end:
         remaining = int((warmup_end - datetime.now(timezone.utc)).total_seconds())
-        log.info(f"   Préchauffage... encore {remaining}s")
+        log.info(f"   Prechauffage... encore {remaining}s")
         for i in range(0, len(all_pairs), BATCH_SIZE):
             batch = all_pairs[i:i+BATCH_SIZE]
             ticker_data = get_ticker(batch)
@@ -403,25 +387,20 @@ def main():
             time.sleep(1)
         time.sleep(SCAN_INTERVAL)
 
-    log.info("[OK] Préchauffage terminé — Le bot trade maintenant !")
+    log.info("[OK] Prechauffage termine - Le bot trade maintenant !")
 
     while True:
         try:
-            # -----------------------------------------------
-            # CAS 1 : Position active → surveillance rapide
-            # -----------------------------------------------
+            # CAS 1 : Position active
             if position["active"]:
                 current_price = get_current_price(position["pair"])
 
                 if current_price is None:
-                    log.warning("Prix indisponible, nouvelle tentative...")
                     time.sleep(2)
                     continue
 
-                # Enregistre le prix dans la fenêtre dump
                 position_prices.append((datetime.now(timezone.utc), current_price))
 
-                # Mise à jour du plus haut
                 if current_price > position["highest_price"]:
                     position["highest_price"] = current_price
                     log.info(f"[HAUSSE] Nouveau plus haut : {current_price:.6f}")
@@ -430,8 +409,6 @@ def main():
                 highest      = position["highest_price"]
                 pct_from_buy = ((current_price - buy_price) / buy_price) * 100
                 pct_from_top = ((current_price - highest) / highest) * 100
-
-                # Détection dump brutal
                 is_dump, dump_pct = detect_dump(current_price)
 
                 log.info(
@@ -441,53 +418,49 @@ def main():
                     f"Dump60s: {dump_pct:+.2f}%"
                 )
 
-                # PRIORITE 1 — STOP LOSS : -1% depuis l'achat (ABSOLU, toujours en premier)
+                # PRIORITE 1 — STOP LOSS -1% ABSOLU
                 if pct_from_buy <= -STOP_LOSS_PCT:
-                    log.warning(f"[STOP] STOP LOSS déclenché à {pct_from_buy:.2f}%")
+                    log.warning(f"[STOP] STOP LOSS a {pct_from_buy:.2f}%")
                     success = sell_market(position["pair"], position["volume"], reason="STOP LOSS")
                     if success:
-                        log.info(f"[PERTE] Trade fermé en perte: {pct_from_buy:.2f}%")
-                        reset_position()
+                        log.info(f"[PERTE] Trade ferme : {pct_from_buy:.2f}%")
                     else:
-                        log.error("[ATTENTION] Vente stop loss échouée ! Nouvelle tentative dans 2s...")
+                        log.error("[ATTENTION] Vente echouee, nouvelle tentative...")
                         time.sleep(2)
                         sell_market(position["pair"], position["volume"], reason="STOP LOSS RETRY")
-                        reset_position()
+                    reset_position()
 
-                # PRIORITE 2 — DUMP BRUTAL : -5% en 60s SEULEMENT si on est encore en profit
+                # PRIORITE 2 — DUMP BRUTAL si en profit
                 elif is_dump and pct_from_buy > 0:
-                    log.warning(f"[DUMP] DUMP BRUTAL EN PROFIT ! {dump_pct:.2f}% en {DUMP_WINDOW_SEC}s → VENTE")
+                    log.warning(f"[DUMP] DUMP BRUTAL en profit ! {dump_pct:.2f}%")
                     success = sell_market(position["pair"], position["volume"], reason="DUMP BRUTAL")
                     if success:
-                        log.info(f"[RAPIDE] Sorti en profit | P&L: {pct_from_buy:.2f}%")
-                        reset_position()
+                        log.info(f"[BENEF] Sorti en profit : {pct_from_buy:.2f}%")
                     else:
-                        log.error("[ATTENTION] Vente dump échouée ! Nouvelle tentative dans 2s...")
+                        log.error("[ATTENTION] Vente dump echouee, nouvelle tentative...")
                         time.sleep(2)
-                        sell_market(position["pair"], position["volume"], reason="DUMP BRUTAL RETRY")
-                        reset_position()
+                        sell_market(position["pair"], position["volume"], reason="DUMP RETRY")
+                    reset_position()
 
-                # PRIORITE 3 — TRAILING STOP : -5% depuis le plus haut ET en profit
+                # PRIORITE 3 — TRAILING STOP si en profit
                 elif pct_from_top <= -TRAILING_STOP_PCT and pct_from_buy > 0:
-                    log.info(f"[TP] TRAILING STOP | Profit final: {pct_from_buy:.2f}%")
+                    log.info(f"[TP] TRAILING STOP | Profit : {pct_from_buy:.2f}%")
                     success = sell_market(position["pair"], position["volume"], reason="TRAILING STOP")
                     if success:
-                        log.info(f"[BENEF] Trade fermé en bénéfice: {pct_from_buy:.2f}%")
-                        reset_position()
+                        log.info(f"[BENEF] Trade ferme en benefice : {pct_from_buy:.2f}%")
                     else:
-                        log.error("[ATTENTION] Vente trailing stop échouée ! Nouvelle tentative dans 2s...")
+                        log.error("[ATTENTION] Vente TP echouee, nouvelle tentative...")
                         time.sleep(2)
-                        sell_market(position["pair"], position["volume"], reason="TRAILING STOP RETRY")
-                        reset_position()
+                        sell_market(position["pair"], position["volume"], reason="TRAILING RETRY")
+                    reset_position()
 
-                # Vérification rapide toutes les 3 secondes en position
                 time.sleep(POSITION_INTERVAL)
 
-            # -----------------------------------------------
-            # CAS 2 : Pas de position → scanner le marché
-            # -----------------------------------------------
+            # CAS 2 : Pas de position
             else:
-                log.info(f"[SCAN] Scan du marché ({len(all_pairs)} paires)...")
+                # Refresh des paires (pour inclure la blacklist)
+                all_pairs = get_all_usd_pairs()
+                log.info(f"[SCAN] Scan du marche ({len(all_pairs)} paires)...")
 
                 all_ticker = {}
                 for i in range(0, len(all_pairs), BATCH_SIZE):
@@ -501,18 +474,17 @@ def main():
 
                 if pump:
                     pair, price, pct = pump
-                    log.info(f"[PUMP] PUMP DÉTECTÉ ! {pair} | +{pct:.2f}% en {WINDOW_MINUTES} min")
+                    log.info(f"[PUMP] PUMP DETECTE ! {pair} | +{pct:.2f}% en {WINDOW_MINUTES} min")
 
                     usd_balance = get_usd_balance()
 
                     if usd_balance < 10:
-                        log.warning(f"Solde insuffisant : {usd_balance:.2f}$ (minimum 10$)")
+                        log.warning(f"Solde insuffisant : {usd_balance:.2f}$")
                         time.sleep(SCAN_INTERVAL)
                         continue
 
                     usd_to_use = usd_balance * 0.98
-
-                    result = buy_market(pair, usd_to_use)
+                    result     = buy_market(pair, usd_to_use)
 
                     if result:
                         volume, buy_price = result
@@ -521,24 +493,23 @@ def main():
                         position["buy_price"]     = buy_price
                         position["highest_price"] = buy_price
                         position["volume"]        = volume
-                        # Initialise la fenêtre dump avec le prix d'achat
                         position_prices.clear()
                         position_prices.append((datetime.now(timezone.utc), buy_price))
                         log.info(f"[POSITION] Position ouverte | {pair} | Prix: {buy_price:.6f} | Volume: {volume}")
-                        log.info(f"[RAPIDE] Surveillance rapide activée (toutes les {POSITION_INTERVAL}s)")
+                        log.info(f"[RAPIDE] Surveillance rapide activee (toutes les {POSITION_INTERVAL}s)")
                     else:
-                        log.warning(f"Achat échoué sur {pair}, scan suivant...")
+                        log.warning(f"Achat echoue sur {pair}, scan suivant...")
 
                 else:
-                    log.info("[ATTENTE] Aucun pump détecté. Attente...")
+                    log.info("[ATTENTE] Aucun pump detecte. Attente...")
 
                 time.sleep(SCAN_INTERVAL)
 
         except KeyboardInterrupt:
-            log.info("[ARRET] Bot arrêté manuellement.")
+            log.info("[ARRET] Bot arrete manuellement.")
             if position["active"]:
-                log.warning(f"[ATTENTION]  ATTENTION: Position encore ouverte sur {position['pair']} !")
-                log.warning(f"   Pense à vendre manuellement sur Kraken !")
+                log.warning(f"[ATTENTION] Position ouverte sur {position['pair']} !")
+                log.warning("Pense a vendre manuellement sur Kraken !")
             break
         except Exception as e:
             log.error(f"Erreur inattendue: {e}")
